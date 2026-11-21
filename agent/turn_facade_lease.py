@@ -17,9 +17,16 @@ from typing import Any, Dict, List, Optional
 
 from agent.agent_init_session import agent_interface
 from process_identity import holder_namespace_token
+from agent.interrupt_control import _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
+
+# Soft, human-originated interrupts that mean "a message arrived", not "stop the session".
+# An inherited one of these is the incoming turn's own arrival signal and must be cleared
+# before that turn starts (see ``admit_durable_turn_lease``). ``_REASON_HARD_STOP`` is
+# deliberately absent: a /stop is a deliberate stop and keeps refusing the wait.
+_SOFT_USER_INTERRUPTS = frozenset({_REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT})
 
 # ``tool_reason`` for a lost session turn lease: attributes the stop to the lease, not the user (#112647).
 _REASON_LEASE_LOST = "session turn lease lost"
@@ -361,6 +368,44 @@ def admit_durable_turn_lease(
         )
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
+
+    # ``_interrupt_requested`` is a turn-scoped flag living on a per-session CACHED agent, but this
+    # admission runs BEFORE the turn it belongs to exists. A SOFT interrupt inherited from the
+    # previous turn is that turn's own end signal — and under ``busy_input_mode: interrupt`` it is
+    # literally THIS turn's arrival: the new message interrupted the previous turn, then became the
+    # turn whose admission read its own arrival signal as a stop order.
+    #
+    # Evidence (13 consecutive "Stopped waiting ... Your message was not processed." refusals): every
+    # one was ``aborted by interrupt`` at 0.00s, and the log holds ZERO "waiting for another Hermes
+    # process" notices — the lease was FREE and nothing was ever waited for.
+    #
+    # So clear an inherited soft-user interrupt here, before the attempt: left set it refuses this
+    # turn at the very first ``should_abort`` call, and even if admitted it would break the fresh turn
+    # at its first iteration check — either way the user's message is swallowed. A HARD stop
+    # (``/stop``) is deliberately NOT cleared: there the user asked for the stop to stand, so it keeps
+    # refusing the wait exactly as before. ``should_abort`` itself stays a plain flag read, so an
+    # interrupt that lands WHILE we wait (or a /stop) still aborts the wait.
+    #
+    # ``preserve_redirect=True``: a user correction that arrived by REDIRECT also sets
+    # ``_interrupt_requested``, and that text is still owed to the loop's next drain — clearing it
+    # wholesale would drop the user's message on the floor.
+    _inherited_reason = getattr(agent, "_tool_interrupt_reason", None)
+    if getattr(agent, "_interrupt_requested", False) and _inherited_reason in _SOFT_USER_INTERRUPTS:
+        logger.info(
+            "Cleared the '%s' interrupt inherited from the previous turn before starting: %s",
+            _inherited_reason, session_id,
+        )
+        try:
+            # Returns False WITHOUT clearing when no redirect is pending; the plain clear is then
+            # safe and also resets the per-thread tool signal.
+            if not agent.clear_interrupt(preserve_redirect=True):
+                agent.clear_interrupt()
+        except TypeError:
+            # Legacy doubles without the keyword: clear the flag only, never the redirect.
+            agent._interrupt_requested = False
+            agent._interrupt_message = None
+        except Exception:
+            logger.debug("could not clear the inherited interrupt", exc_info=True)
     wait = dict(
         ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, on_contended=_on_contended,

@@ -328,3 +328,83 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+# ---------------------------------------------------------------------------
+# A SOFT interrupt inherited from the previous turn must not refuse this one
+# ---------------------------------------------------------------------------
+
+
+def test_soft_interrupt_inherited_from_previous_turn_does_not_refuse_admission(monkeypatch):
+    """A "user sent a new message" interrupt left by the PREVIOUS turn must not refuse this one.
+
+    ``_interrupt_requested`` is a turn-scoped flag living on a per-session CACHED agent, but the
+    admission runs BEFORE the turn it belongs to exists. Under ``busy_input_mode: interrupt`` the
+    incoming message interrupts the previous turn and then BECOMES this turn — whose admission
+    read its own arrival signal as a stop order.
+
+    The refusals it produced were ``aborted by interrupt`` at 0.00s with no "waiting for another
+    Hermes process" notice, i.e. the lease was free and nothing was ever waited for.
+    """
+    monkeypatch.setattr(
+        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
+    )
+    agent = _agent(
+        _Db(),
+        _interrupt_requested=True,
+        _interrupt_message="user sent a new message",
+        _tool_interrupt_reason="user sent a new message",
+    )
+    cleared = []
+
+    def _clear(*, preserve_redirect=False):
+        cleared.append(preserve_redirect)
+        agent._interrupt_requested = False
+        return True
+
+    agent.clear_interrupt = _clear
+
+    admission = _admit(agent)
+
+    assert admission.early_result is None and admission.lease is not None
+    assert cleared == [True], "the inherited soft interrupt must be cleared, redirect preserved"
+    assert agent._interrupt_requested is False
+    admission.lease.stop_refresher()
+    admission.lease.join_threads()
+    admission.lease.release()
+
+
+def test_hard_stop_inherited_from_previous_turn_still_refuses_admission():
+    """``/stop`` is a deliberate stop: it keeps refusing the wait, inherited or not."""
+    agent = _agent(
+        _Db(acquired=False),
+        _interrupt_requested=True,
+        _interrupt_message="explicit stop requested",
+        _tool_interrupt_reason="explicit stop requested",
+    )
+    agent.clear_interrupt = lambda **kw: True
+
+    admission = _admit(agent)
+
+    assert admission.lease is None
+    assert admission.early_result["interrupted"] is True
+
+
+def test_interrupt_raised_during_the_wait_still_aborts():
+    """An interrupt that lands WHILE we wait is aimed at this wait and must still abort it."""
+    db = _Db(acquired=False)
+    agent = _agent(db)
+    agent.clear_interrupt = lambda **kw: True
+
+    def acquire(session_id, holder, **kwargs):
+        # The user interrupts while the wait is in progress.
+        agent._interrupt_requested = True
+        agent._tool_interrupt_reason = "user sent a new message"
+        return kwargs["should_abort"]() and False or False
+
+    db.acquire_session_turn_lease = acquire
+
+    admission = _admit(agent)
+
+    assert admission.lease is None
+    assert admission.early_result is not None, "an interrupt during the wait must not be swallowed"
