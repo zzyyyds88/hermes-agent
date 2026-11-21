@@ -711,6 +711,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # gateway/tui watchers deliberately ignore this set.
         # See #8228.
         self._poll_observed: set = set()
+        # Owner polls: the spawning session polled AFTER the exit, so it already has the
+        # completion inline. Gateway/tui watchers must skip the autonomous delivery turn
+        # here or the chat gets a duplicate "old receipt" turn. A poll from any other
+        # session only observes and stays non-consuming.
+        self._poll_observed_by_parent: set = set()
         # Global watch-match circuit breaker across all sessions.
         self._global_watch_lock = threading.Lock()
         self._global_watch_window_start = self._global_watch_tripped_until = 0.0
@@ -1647,6 +1652,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """True once wait/log/kill/acked poll consumed it; keyed by the full id, never a short prefix."""
         return session_id in self._completion_consumed
 
+    def is_completion_observed(self, session_id: str) -> bool:
+        """True when the completion was consumed (wait/log) or already observed by the
+        spawning session via poll(). Watchers use this to avoid a duplicate delivery turn;
+        CLI drains additionally use ``_poll_observed`` for any inline poll."""
+        return (session_id in self._completion_consumed
+                or session_id in self._poll_observed_by_parent)
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
         this session: still running AND, with ``watch_patterns``, none matched yet (a
@@ -1754,8 +1766,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def _drain_should_skip(self, session_id: str, *, skip_poll_observed: bool = True) -> bool:
         """Skip a completion the CLI agent already has this turn — consumed via wait/log
-        or observed inline via poll(). Gateway/tui watchers check only
-        ``is_completion_consumed`` so a read-only poll never suppresses their turn.
+        or observed inline via poll(). Gateway/tui watchers use ``is_completion_observed``
+        (consumed or owner-polled), so a poll from another session never suppresses their
+        turn.
 
         Skips when the agent has either truly consumed the output (wait/log → ``_completion_consumed``) or
         observed the exit inline via poll() (``_poll_observed``). In both cases the CLI agent already has
@@ -1985,8 +1998,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _status_head(session: ProcessSession) -> dict:
         return {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running"}
 
-    def poll(self, session_id: str, acknowledge: bool = False) -> dict:
-        """Check status and get new output for a background process."""
+    def poll(self, session_id: str, acknowledge: bool = False, *,
+             observer_session_id: str = "") -> dict:
+        """Check status and get new output for a background process.
+
+        ``observer_session_id`` is the polling agent session. When it is the process's
+        spawning session and the process has exited, the completion is marked observed so
+        the gateway watcher does not inject a duplicate turn for a result already in hand.
+        """
         session = self.get(session_id)
         if session is None or self._uncollected_gone(session):
             return _not_found(session_id)
@@ -2008,6 +2027,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 self._poll_observed.add(session.id)
                 if acknowledge:
                     self._completion_consumed.add(session.id)
+                parent_session_id = str(getattr(session, "parent_session_id", "") or "")
+                if observer_session_id and parent_session_id == observer_session_id:
+                    self._poll_observed_by_parent.add(session.id)
         if session.detached and not session.output_log:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
@@ -2555,6 +2577,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         tracked = self._running.keys() | self._finished.keys()
         self._completion_consumed &= tracked
         self._poll_observed &= tracked
+        self._poll_observed_by_parent &= tracked
 
 
 
@@ -2698,7 +2721,15 @@ def _handle_process(args, **kw):
             return json.dumps(_not_found(session_id), ensure_ascii=False)
         handler, redact = _SESSION_ACTIONS[action]
         from tools.process_registry_wait_policy import apply_wait_poll_policy
-        result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
+        if action == "poll":
+            # Poll goes through the registry directly so the caller's session id reaches it;
+            # every other action keeps its _SESSION_ACTIONS handler.
+            result = process_registry.poll(
+                session_id, acknowledge=args.get("acknowledge") is True,
+                observer_session_id=str(kw.get("session_id") or ""))
+        else:
+            result = handler(session_id, args)
+        result = apply_wait_poll_policy(action, session_id, result)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
 

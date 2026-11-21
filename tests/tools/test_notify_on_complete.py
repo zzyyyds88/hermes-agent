@@ -241,9 +241,11 @@ class TestCompletionConsumed:
 
 
     def test_poll_observed_does_not_suppress_gateway_watcher(self, registry):
-        """The gateway/tui watcher gate (is_completion_consumed) must stay False
-        after a read-only poll, so the autonomous delivery turn still fires
-        even though the CLI drain was deduped (#10156)."""
+        """A poll that names no observing owner session leaves the watcher gate
+        untouched, so the autonomous delivery turn still fires even though the
+        CLI drain was deduped (#10156). The owner-poll case (the spawning
+        session polls after exit => watcher suppressed) is covered in
+        test_process_registry_owner_poll.py."""
         s = _make_session(sid="proc_gw", notify_on_complete=True, output="done")
         s.exited = True
         s.exit_code = 0
@@ -251,7 +253,7 @@ class TestCompletionConsumed:
 
         registry.poll("proc_gw")
         # The gateway watcher gate is untouched, so it still delivers.
-        assert not registry.is_completion_consumed("proc_gw")
+        assert not registry.is_completion_observed("proc_gw")
 
 
     def test_short_id_poll_dedupes_cli_completion_without_consuming_gateway_turn(self, registry):
